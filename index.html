@@ -190,6 +190,12 @@
   .a6-card .page-no{
     position:absolute; right:5mm; bottom:3mm; font-size:6pt; color:#888; font-family:'Jost',sans-serif;
   }
+  .a6-card .card-body mark.hl{
+    background:#fff59d; color:inherit; padding:0 1px; border-radius:1px;
+  }
+  @media print{
+    *{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+  }
 </style>
 </head>
 <body>
@@ -229,6 +235,9 @@
     <div class="field">
       <label>本文</label>
       <textarea id="fieldBody" placeholder="本文を入力"></textarea>
+      <div style="font-size:11px; color:var(--ink-soft); margin-top:4px; line-height:1.6;">
+        *で囲むと印刷時に黄色いマーカーがつきます(例:明日までに<b>*要確認*</b>)
+      </div>
     </div>
     <div class="field">
       <label>画像（任意・貼り付け／選択どちらも可）</label>
@@ -334,7 +343,7 @@ function initGis(){
       await onSignedIn();
     }
   });
-  document.getElementById('signInBtn').addEventListener('click', ()=> tokenClient.requestAccessToken({prompt:'consent'}));
+  document.getElementById('signInBtn').addEventListener('click', ()=> tokenClient.requestAccessToken());
   document.getElementById('signOutBtn').addEventListener('click', signOut);
 }
 
@@ -507,7 +516,7 @@ function renderList(){
       <div class="thumb empty" data-thumb></div>
       <div class="info">
         <p class="title">${escapeHtml(p.title || '(無題)')}</p>
-        <p class="body">${escapeHtml((p.body||'').slice(0,60))}</p>
+        <p class="body">${escapeHtml(stripMarkers(p.body).slice(0,60))}</p>
       </div>
       <div class="actions">
         <button class="icon-btn" data-edit>✎</button>
@@ -546,6 +555,7 @@ function renderList(){
 function escapeHtml(s){
   return (s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
+function stripMarkers(s){ return (s||'').replace(/\*/g,''); }
 
 /* ---------- 編集モーダル ---------- */
 let editingId = null;
@@ -751,25 +761,71 @@ function fitsInBox(text, widthMm, heightMm){
   return fits;
 }
 
+/* *で囲んだ範囲をハイライトとして抜き出す。戻り値: {plain(記号抜きの本文), ranges(plain内の開始・終了位置)} */
+function extractHighlights(raw){
+  const s = raw || '';
+  let plain = '';
+  const ranges = [];
+  const re = /\*([^*]+)\*/g;
+  let lastIndex = 0, m;
+  while((m = re.exec(s)) !== null){
+    plain += s.slice(lastIndex, m.index);
+    const start = plain.length;
+    plain += m[1];
+    ranges.push({start, end: plain.length});
+    lastIndex = re.lastIndex;
+  }
+  plain += s.slice(lastIndex);
+  return {plain, ranges};
+}
+/* cutAt位置でrangesを「使った分」と「持ち越す分」に分割する */
+function splitRanges(ranges, cutAt){
+  const used = [], carried = [];
+  ranges.forEach(r=>{
+    if(r.end <= cutAt){ used.push({start:r.start, end:r.end}); }
+    else if(r.start >= cutAt){ carried.push({start:r.start-cutAt, end:r.end-cutAt}); }
+    else { used.push({start:r.start, end:cutAt}); carried.push({start:0, end:r.end-cutAt}); }
+  });
+  return {used, carried};
+}
+/* テキストとハイライト範囲から、<mark>入りのHTMLを組み立てる */
+function renderHighlightedHtml(text, ranges){
+  if(!ranges || ranges.length===0) return escapeHtml(text);
+  const sorted = [...ranges].sort((a,b)=>a.start-b.start);
+  let html = '', pos = 0;
+  sorted.forEach(r=>{
+    if(r.start>pos) html += escapeHtml(text.slice(pos, r.start));
+    html += `<mark class="hl">${escapeHtml(text.slice(r.start, r.end))}</mark>`;
+    pos = r.end;
+  });
+  if(pos < text.length) html += escapeHtml(text.slice(pos));
+  return html;
+}
+
 function buildFlowCards(orderedPages, imageUrls){
   const cardsOut = [];
   let curImageUrl = null;
   let curText = '';
+  let curRanges = [];
 
   function budget(){ return curImageUrl ? (CARD_TEXT_H_MM - IMAGE_RESERVE_MM) : CARD_TEXT_H_MM; }
   function closeCard(){
-    if(curText.length>0 || curImageUrl){ cardsOut.push({imageUrl:curImageUrl, text:curText}); }
-    curImageUrl = null; curText = '';
+    if(curText.length>0 || curImageUrl){ cardsOut.push({imageUrl:curImageUrl, text:curText, ranges:curRanges}); }
+    curImageUrl = null; curText = ''; curRanges = [];
   }
-  function appendText(fullChunk){
+  function appendText(fullChunk, itemRanges){
     let remaining = fullChunk;
+    let remRanges = itemRanges || [];
     let guard = 0;
     while(remaining.length > 0 && guard < 500){
       guard++;
       const sep = curText.length>0 ? '\n\n' : '';
+      const sepLen = sep.length;
       const b = budget();
       if(fitsInBox(curText+sep+remaining, CARD_W_MM, b)){
-        curText = curText+sep+remaining; remaining=''; break;
+        const base = curText.length + sepLen;
+        curRanges = curRanges.concat(remRanges.map(r=>({start:r.start+base, end:r.end+base})));
+        curText = curText+sep+remaining; remaining=''; remRanges=[]; break;
       }
       let lo=0, hi=remaining.length;
       while(lo<hi){
@@ -777,27 +833,41 @@ function buildFlowCards(orderedPages, imageUrls){
         if(fitsInBox(curText+sep+remaining.slice(0,mid), CARD_W_MM, b)) lo=mid; else hi=mid-1;
       }
       if(lo>0){
+        const {used, carried} = splitRanges(remRanges, lo);
+        const base = curText.length + sepLen;
+        curRanges = curRanges.concat(used.map(r=>({start:r.start+base, end:r.end+base})));
         curText = curText+sep+remaining.slice(0,lo);
         remaining = remaining.slice(lo);
+        remRanges = carried;
       }
       closeCard();
       if(lo===0 && curText==='' && !curImageUrl && remaining.length>0){
         // 空のカードでも1文字も入らない異常系の保険：強制的に1文字だけ置いて進める
+        const {used, carried} = splitRanges(remRanges, 1);
+        curRanges = used;
         curText = remaining.slice(0,1);
         remaining = remaining.slice(1);
+        remRanges = carried;
       }
     }
   }
 
   orderedPages.forEach(p=>{
-    const body = (p.body||'').trim();
+    const {plain, ranges} = extractHighlights(p.body||'');
+    const leadWs = plain.match(/^\s*/)[0].length;
+    const trailWs = plain.match(/\s*$/)[0].length;
+    const body = plain.slice(leadWs, plain.length - trailWs);
+    const adj = ranges
+      .map(r=>({start:r.start-leadWs, end:r.end-leadWs}))
+      .map(r=>({start:Math.max(0,r.start), end:Math.min(body.length, r.end)}))
+      .filter(r=>r.end>r.start);
     if(p.imageFileId){
       closeCard();
       curImageUrl = imageUrls[p.id] || null;
-      curText = '';
-      if(body) appendText(body);
+      curText = ''; curRanges = [];
+      if(body) appendText(body, adj);
     } else if(body){
-      appendText(body);
+      appendText(body, adj);
     }
   });
   closeCard();
@@ -837,7 +907,7 @@ document.getElementById('printBtn').addEventListener('click', async ()=>{
       card.className = 'a6-card';
       card.innerHTML = `
         ${c.imageUrl ? `<img class="card-image" src="${c.imageUrl}">` : ''}
-        <div class="card-body">${escapeHtml(c.text)}</div>
+        <div class="card-body">${renderHighlightedHtml(c.text, c.ranges)}</div>
         <div class="page-no">${j+1} / ${total}</div>
       `;
       sheet.appendChild(card);

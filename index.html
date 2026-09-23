@@ -730,7 +730,80 @@ document.getElementById('calibPrintBtn').addEventListener('click', ()=>{
   }, 100);
 });
 
-/* ---------- 印刷 ---------- */
+/* ---------- 印刷：本文を連続して流し込み、自動で改ページする ---------- */
+const CARD_W_MM = 93;      // カード内側の幅（119mm - 左右13mm×2）
+const CARD_H_MM = 122;     // カード内側の高さ（148mm - 上下13mm×2）
+const CARD_TEXT_H_MM = 116; // 下部の余白(ページ番号用)を差し引いた本文エリアの高さ
+const IMAGE_RESERVE_MM = 59; // 画像がある場合に確保する高さ(画像55mm+隙間4mm)
+
+function fitsInBox(text, widthMm, heightMm){
+  const box = document.createElement('div');
+  box.style.position = 'fixed'; box.style.left = '-9999px'; box.style.top = '0';
+  box.style.width = widthMm + 'mm'; box.style.height = heightMm + 'mm';
+  box.style.overflow = 'hidden'; box.style.boxSizing = 'border-box';
+  box.style.fontFamily = "'Zen Kaku Gothic New',sans-serif";
+  box.style.fontSize = '7pt'; box.style.lineHeight = '1.55';
+  box.style.whiteSpace = 'pre-wrap'; box.style.wordBreak = 'break-word';
+  box.textContent = text;
+  document.body.appendChild(box);
+  const fits = box.scrollHeight <= box.clientHeight + 1;
+  document.body.removeChild(box);
+  return fits;
+}
+
+function buildFlowCards(orderedPages, imageUrls){
+  const cardsOut = [];
+  let curImageUrl = null;
+  let curText = '';
+
+  function budget(){ return curImageUrl ? (CARD_TEXT_H_MM - IMAGE_RESERVE_MM) : CARD_TEXT_H_MM; }
+  function closeCard(){
+    if(curText.length>0 || curImageUrl){ cardsOut.push({imageUrl:curImageUrl, text:curText}); }
+    curImageUrl = null; curText = '';
+  }
+  function appendText(fullChunk){
+    let remaining = fullChunk;
+    let guard = 0;
+    while(remaining.length > 0 && guard < 500){
+      guard++;
+      const sep = curText.length>0 ? '\n\n' : '';
+      const b = budget();
+      if(fitsInBox(curText+sep+remaining, CARD_W_MM, b)){
+        curText = curText+sep+remaining; remaining=''; break;
+      }
+      let lo=0, hi=remaining.length;
+      while(lo<hi){
+        const mid = Math.ceil((lo+hi)/2);
+        if(fitsInBox(curText+sep+remaining.slice(0,mid), CARD_W_MM, b)) lo=mid; else hi=mid-1;
+      }
+      if(lo>0){
+        curText = curText+sep+remaining.slice(0,lo);
+        remaining = remaining.slice(lo);
+      }
+      closeCard();
+      if(lo===0 && curText==='' && !curImageUrl && remaining.length>0){
+        // 空のカードでも1文字も入らない異常系の保険：強制的に1文字だけ置いて進める
+        curText = remaining.slice(0,1);
+        remaining = remaining.slice(1);
+      }
+    }
+  }
+
+  orderedPages.forEach(p=>{
+    const body = (p.body||'').trim();
+    if(p.imageFileId){
+      closeCard();
+      curImageUrl = imageUrls[p.id] || null;
+      curText = '';
+      if(body) appendText(body);
+    } else if(body){
+      appendText(body);
+    }
+  });
+  closeCard();
+  return cardsOut;
+}
+
 document.getElementById('printBtn').addEventListener('click', async ()=>{
   if(pages.length === 0){ showToast('ページがありません'); return; }
   showToast('印刷を準備中…');
@@ -738,9 +811,7 @@ document.getElementById('printBtn').addEventListener('click', async ()=>{
   printArea.innerHTML = '';
 
   const ordered = [...pages].sort((a,b)=>a.order-b.order);
-  const total = ordered.length;
 
-  // 画像を先に全部読み込んでおく
   const urls = {};
   await Promise.all(ordered.map(async p=>{
     if(p.imageFileId){
@@ -748,24 +819,25 @@ document.getElementById('printBtn').addEventListener('click', async ()=>{
     }
   }));
 
+  const cardsOut = buildFlowCards(ordered, urls);
+  const total = cardsOut.length;
+
   let sheetCount = 0;
   for(let i=0; i<total; i+=2){
     const sheet = document.createElement('div');
     sheet.className = 'a4-sheet';
-    // 両面印刷ON時、奇数番目のシート(=各A4の裏面にあたる)にだけキャリブレーション補正を適用
     const isBackSide = printSettings.duplex && (sheetCount % 2 === 1);
     if(isBackSide && (printSettings.offsetX || printSettings.offsetY)){
       sheet.style.transform = `translate(${printSettings.offsetX}mm, ${printSettings.offsetY}mm)`;
     }
     sheetCount++;
     for(let j=i; j<Math.min(i+2,total); j++){
-      const p = ordered[j];
+      const c = cardsOut[j];
       const card = document.createElement('div');
       card.className = 'a6-card';
       card.innerHTML = `
-        <div class="card-title">${escapeHtml(p.title||'(無題)')}</div>
-        ${urls[p.id] ? `<img class="card-image" src="${urls[p.id]}">` : ''}
-        <div class="card-body">${escapeHtml(p.body||'')}</div>
+        ${c.imageUrl ? `<img class="card-image" src="${c.imageUrl}">` : ''}
+        <div class="card-body">${escapeHtml(c.text)}</div>
         <div class="page-no">${j+1} / ${total}</div>
       `;
       sheet.appendChild(card);
@@ -773,17 +845,7 @@ document.getElementById('printBtn').addEventListener('click', async ()=>{
     printArea.appendChild(sheet);
   }
 
-  // 本文が入りきらないカードは、収まるまで少しずつ縮小(7pt→5pt)
-  requestAnimationFrame(()=>{
-    document.querySelectorAll('.a6-card .card-body').forEach(el=>{
-      let size = 7;
-      while(el.scrollHeight > el.clientHeight && size > 5){
-        size -= 0.5;
-        el.style.fontSize = size+'pt';
-      }
-    });
-    setTimeout(()=>window.print(), 150);
-  });
+  setTimeout(()=>window.print(), 150);
 });
 </script>
 </body>

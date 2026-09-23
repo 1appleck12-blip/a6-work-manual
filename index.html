@@ -133,13 +133,32 @@
   #toast.show{ opacity:1; }
 
   /* ---- Print layout ---- */
-  #printArea{ display:none; }
+  #printArea, #calibrationArea{ display:none; }
   @media print{
     body *{ visibility:hidden; }
     #printArea, #printArea *{ visibility:visible; }
     #printArea{ display:block; position:absolute; top:0; left:0; }
-    header, #fab, #editModal, #toast{ display:none !important; }
+    body.calibrating #printArea, body.calibrating #printArea *{ visibility:hidden; }
+    body.calibrating #calibrationArea, body.calibrating #calibrationArea *{ visibility:visible; }
+    body.calibrating #calibrationArea{ display:block; position:absolute; top:0; left:0; }
+    header, #fab, #editModal, #settingsModal, #toast{ display:none !important; }
     @page{ size:A4; margin:0; }
+  }
+  .calib-sheet{
+    width:210mm; height:297mm; position:relative; page-break-after:always;
+  }
+  .calib-sheet:last-child{ page-break-after:auto; }
+  .calib-cross{
+    position:absolute; width:10mm; height:10mm; transform:translate(-50%,-50%);
+  }
+  .calib-cross::before, .calib-cross::after{
+    content:''; position:absolute; background:#000;
+  }
+  .calib-cross::before{ left:50%; top:0; bottom:0; width:0.3mm; transform:translateX(-50%); }
+  .calib-cross::after{ top:50%; left:0; right:0; height:0.3mm; transform:translateY(-50%); }
+  .calib-label{
+    position:absolute; top:50%; left:50%; transform:translate(-50%, 12mm);
+    font-size:9pt; font-family:'Zen Kaku Gothic New',sans-serif;
   }
   .a4-sheet{
     width:210mm; height:297mm;
@@ -154,13 +173,9 @@
     border:0.15mm dashed #999;
     box-sizing:border-box;
     display:flex; flex-direction:column;
-    padding:6mm 7mm 6mm 21mm; /* 左21mm = 綴じしろ15mm + 内側余白6mm */
+    padding:13mm; /* 4辺とも13mm。綴じ方向やズレを気にしなくていいよう全周に余白を確保 */
     position:relative;
     overflow:hidden;
-  }
-  .a6-card .bind-guide{
-    position:absolute; left:15mm; top:0; bottom:0; width:0;
-    border-left:0.15mm dotted #ccc;
   }
   .a6-card .card-title{
     font-size:9pt; font-weight:700; margin:0 0 2.5mm; line-height:1.3;
@@ -185,6 +200,7 @@
     <div class="sub" id="statusLine">未ログイン</div>
   </div>
   <div class="btn-row">
+    <button class="icon-btn" id="settingsBtn" hidden title="両面印刷設定" style="font-size:20px;">⚙</button>
     <button class="btn ghost" id="printBtn" disabled>印刷</button>
     <button class="btn ghost" id="signOutBtn" hidden>ログアウト</button>
   </div>
@@ -234,7 +250,40 @@
 </div>
 
 <div id="printArea"></div>
+<div id="calibrationArea"></div>
 <div id="toast"></div>
+
+<!-- 両面印刷・キャリブレーション設定モーダル -->
+<div id="settingsModal" hidden>
+  <div class="sheet">
+    <h2>両面印刷の設定</h2>
+    <div class="field" style="display:flex; align-items:center; justify-content:space-between;">
+      <label style="margin:0;">両面印刷を使う</label>
+      <input type="checkbox" id="duplexToggle" style="width:20px; height:20px;">
+    </div>
+    <p style="font-size:12px; color:var(--ink-soft); line-height:1.7; margin-top:-6px;">
+      カードの余白は4辺とも13mm確保してあるので、多少ズレても文字が切れたり穴と重なったりしません。それでも「もっと追い込みたい」場合は、下のズレ補正を使ってください。
+    </p>
+    <div class="field">
+      <label>裏面の左右ズレ補正（mm・＋で右へ）</label>
+      <input type="text" inputmode="decimal" id="offsetX" value="0">
+    </div>
+    <div class="field">
+      <label>裏面の上下ズレ補正（mm・＋で下へ）</label>
+      <input type="text" inputmode="decimal" id="offsetY" value="0">
+    </div>
+    <div class="btn-row" style="margin-bottom:14px;">
+      <button class="btn ghost" id="calibPrintBtn">キャリブレーション用紙を印刷</button>
+    </div>
+    <p style="font-size:12px; color:var(--ink-soft); line-height:1.7;">
+      上のボタンで、表裏に十字マークが入ったA4を両面印刷してください。表と裏の十字のズレを定規で測り、右にズレていたら左右補正を＋、下にズレていたら上下補正を＋にして再印刷・微調整します。
+    </p>
+    <div class="sheet-actions">
+      <button class="btn ghost" id="settingsCancelBtn">キャンセル</button>
+      <button class="btn" id="settingsSaveBtn">保存</button>
+    </div>
+  </div>
+</div>
 
 <script>
 /* ============================================================
@@ -250,6 +299,7 @@ let accessToken = null;
 let tokenClient = null;
 let manifestFileId = null;
 let pages = []; // {id, order, title, body, imageFileId}
+let printSettings = {duplex:false, offsetX:0, offsetY:0};
 let imageUrlCache = {}; // fileId -> object URL
 let dragSrcIndex = null;
 
@@ -299,6 +349,7 @@ function signOut(){
   document.getElementById('fab').hidden = true;
   document.getElementById('printBtn').disabled = true;
   document.getElementById('signOutBtn').hidden = true;
+  document.getElementById('settingsBtn').hidden = true;
   document.getElementById('statusLine').textContent = '未ログイン';
 }
 
@@ -309,9 +360,13 @@ async function onSignedIn(){
   document.getElementById('fab').hidden = false;
   document.getElementById('signOutBtn').hidden = false;
   document.getElementById('printBtn').disabled = false;
+  document.getElementById('settingsBtn').hidden = false;
   try{
     await loadManifest();
     document.getElementById('statusLine').textContent = `ログイン中・${pages.length}ページ`;
+    document.getElementById('duplexToggle').checked = printSettings.duplex;
+    document.getElementById('offsetX').value = printSettings.offsetX;
+    document.getElementById('offsetY').value = printSettings.offsetY;
     renderList();
   }catch(e){
     console.error(e);
@@ -359,7 +414,7 @@ async function createManifestFile(initialData){
 async function loadManifest(){
   const file = await findManifestFile();
   if(!file){
-    manifestFileId = await createManifestFile({pages:[]});
+    manifestFileId = await createManifestFile({pages:[], settings:printSettings});
     pages = [];
     return;
   }
@@ -367,13 +422,14 @@ async function loadManifest(){
   const res = await driveFetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`);
   const data = await res.json();
   pages = (data.pages || []).sort((a,b)=>a.order-b.order);
+  if(data.settings){ printSettings = Object.assign(printSettings, data.settings); }
 }
 
 async function saveManifest(){
   await driveFetch(`https://www.googleapis.com/upload/drive/v3/files/${manifestFileId}?uploadType=media`, {
     method:'PATCH',
     headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({pages})
+    body: JSON.stringify({pages, settings:printSettings})
   });
 }
 
@@ -617,6 +673,63 @@ document.getElementById('deletePageBtn').addEventListener('click', async ()=>{
 
 document.getElementById('fab').addEventListener('click', ()=>openEdit(null));
 
+/* ---------- 両面印刷・キャリブレーション設定 ---------- */
+document.getElementById('settingsBtn').addEventListener('click', ()=>{
+  document.getElementById('duplexToggle').checked = printSettings.duplex;
+  document.getElementById('offsetX').value = printSettings.offsetX;
+  document.getElementById('offsetY').value = printSettings.offsetY;
+  document.getElementById('settingsModal').hidden = false;
+});
+document.getElementById('settingsCancelBtn').addEventListener('click', ()=>{
+  document.getElementById('settingsModal').hidden = true;
+});
+document.getElementById('settingsSaveBtn').addEventListener('click', async ()=>{
+  printSettings.duplex = document.getElementById('duplexToggle').checked;
+  printSettings.offsetX = parseFloat(document.getElementById('offsetX').value) || 0;
+  printSettings.offsetY = parseFloat(document.getElementById('offsetY').value) || 0;
+  try{
+    await saveManifest();
+    showToast('設定を保存しました');
+  }catch(e){
+    console.error(e);
+    showToast('設定の保存に失敗しました');
+  }
+  document.getElementById('settingsModal').hidden = true;
+});
+
+document.getElementById('calibPrintBtn').addEventListener('click', ()=>{
+  const area = document.getElementById('calibrationArea');
+  area.innerHTML = '';
+  // 表・裏それぞれに十字マークを4隅+中央に配置したテスト用紙を作る
+  const makeCrossSheet = (label)=>{
+    const sheet = document.createElement('div');
+    sheet.className = 'calib-sheet';
+    const positions = [
+      {top:'10mm', left:'10mm'}, {top:'10mm', right:'10mm'},
+      {bottom:'10mm', left:'10mm'}, {bottom:'10mm', right:'10mm'},
+      {top:'50%', left:'50%'}
+    ];
+    positions.forEach(pos=>{
+      const cross = document.createElement('div');
+      cross.className = 'calib-cross';
+      Object.assign(cross.style, pos);
+      sheet.appendChild(cross);
+    });
+    const tag = document.createElement('div');
+    tag.className = 'calib-label';
+    tag.textContent = label;
+    sheet.appendChild(tag);
+    return sheet;
+  };
+  area.appendChild(makeCrossSheet('表 (FRONT)'));
+  area.appendChild(makeCrossSheet('裏 (BACK) — 両面印刷でここに来る面'));
+  document.body.classList.add('calibrating');
+  setTimeout(()=>{
+    window.print();
+    document.body.classList.remove('calibrating');
+  }, 100);
+});
+
 /* ---------- 印刷 ---------- */
 document.getElementById('printBtn').addEventListener('click', async ()=>{
   if(pages.length === 0){ showToast('ページがありません'); return; }
@@ -635,15 +748,21 @@ document.getElementById('printBtn').addEventListener('click', async ()=>{
     }
   }));
 
+  let sheetCount = 0;
   for(let i=0; i<total; i+=2){
     const sheet = document.createElement('div');
     sheet.className = 'a4-sheet';
+    // 両面印刷ON時、奇数番目のシート(=各A4の裏面にあたる)にだけキャリブレーション補正を適用
+    const isBackSide = printSettings.duplex && (sheetCount % 2 === 1);
+    if(isBackSide && (printSettings.offsetX || printSettings.offsetY)){
+      sheet.style.transform = `translate(${printSettings.offsetX}mm, ${printSettings.offsetY}mm)`;
+    }
+    sheetCount++;
     for(let j=i; j<Math.min(i+2,total); j++){
       const p = ordered[j];
       const card = document.createElement('div');
       card.className = 'a6-card';
       card.innerHTML = `
-        <div class="bind-guide"></div>
         <div class="card-title">${escapeHtml(p.title||'(無題)')}</div>
         ${urls[p.id] ? `<img class="card-image" src="${urls[p.id]}">` : ''}
         <div class="card-body">${escapeHtml(p.body||'')}</div>
